@@ -2,6 +2,7 @@
 
 #define VULKAN_HPP_NO_CONSTRUCTORS
 #include <vulkan/vulkan.h>
+#include <cstddef>
 #include <vulkan/vulkan.hpp>
 #include <vulkan/vulkan_core.h>
 #include <vulkan/vulkan_enums.hpp>
@@ -43,6 +44,9 @@ struct Output {
     // VkSemaphore semaphore;
     VkImageCreateInfo imageCI;
     VkDeviceSize size;
+    // Format SteamVR submitted, kept separate from imageCI.format which is
+    // normalized to UNORM for storage/FFmpeg/DRM compatibility.
+    VkFormat contentFormat;
 };
 
 struct PipelineCreateInfo {
@@ -57,6 +61,23 @@ struct RendererCreateInfo {
     vk::Extent2D outputExtent;
     std::array<int, ImageCount> inputImgFds;
 };
+
+// Push-constant payload for the rotational reprojection fold in the sampling
+// shaders. Field offsets must match the GLSL block (0/64/80/96). enabled == 0
+// reproduces the unwarped sampling exactly, so a zero-initialized struct is a
+// correct passthrough.
+struct WarpParams {
+    float rotation[16] = {}; // column-major mat4, rotation in the upper-left 3x3
+    float leftTans[4] = {}; // tanLeft, tanRight, tanUp, tanDown
+    float rightTans[4] = {};
+    u32 enabled = 0;
+    u32 _padding[3] = {};
+};
+static_assert(sizeof(WarpParams) == 112);
+static_assert(offsetof(WarpParams, rotation) == 0);
+static_assert(offsetof(WarpParams, leftTans) == 64);
+static_assert(offsetof(WarpParams, rightTans) == 80);
+static_assert(offsetof(WarpParams, enabled) == 96);
 
 namespace detail {
 
@@ -75,7 +96,8 @@ namespace detail {
             vk::CommandBuffer cmdBuf,
             vk::ImageView in,
             vk::ImageView out,
-            vk::Extent2D outSize
+            vk::Extent2D outSize,
+            WarpParams const& warp
         );
 
         void destroy(VkContext const& ctx);
@@ -96,13 +118,33 @@ class Renderer {
     vk::CommandBuffer cmdBuf;
     vk::Sampler sampler;
     vk::DescriptorSetLayout descLayout;
-    vk::Fence fence;
 
     std::vector<detail::RenderPipeline> pipes;
 
-    // vk::Semaphore renderFinishedSem;
+    vk::Semaphore renderFinishedSem;
+    uint64_t nextSignalValue = 1;
+    uint64_t lastSubmittedValue = 0;
 
 public:
+    vk::Semaphore getRenderFinishedSemaphore() const { return renderFinishedSem; }
+    uint64_t getLastSubmittedValue() const { return lastSubmittedValue; }
+    void waitForRenderDone(VkContext const& vkCtx) const {
+        if (renderFinishedSem == VK_NULL_HANDLE) {
+            return;
+        }
+
+        vk::SemaphoreWaitInfo waitInfo {
+            .semaphoreCount = 1,
+            .pSemaphores = &renderFinishedSem,
+            .pValues = &lastSubmittedValue,
+        };
+
+        auto result = vkCtx.dev.waitSemaphores(waitInfo, UINT64_MAX);
+        if (result != vk::Result::eSuccess && result != vk::Result::eTimeout) {
+            throw std::runtime_error("Failed waiting for render completion semaphore");
+        }
+    }
+
     Renderer(
         VkContext const& vkCtx,
         RendererCreateInfo& createInfo,
@@ -113,7 +155,13 @@ public:
 
     // NOTE: Use the output immediately afterwards, as this synchronizes to the end of gpu
     // operations
-    void render(VkContext& vkCtx, u32 leftIdx, u32 rightIdx);
+    // waitFds, when given, are sync_file fds imported as temporary semaphores
+    // the submission waits on before the eye copies. Ownership transfers to
+    // this call: a successful import hands the fd to Vulkan, a failed one is
+    // closed here.
+    void render(VkContext& vkCtx, u32 leftIdx, u32 rightIdx, int const waitFds[2] = nullptr);
+
+    WarpParams warpParams {};
 
     Output getOutput() { return output; }
 

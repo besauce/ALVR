@@ -1,4 +1,6 @@
 #include "Renderer.hpp"
+
+#include <unistd.h>
 #include <optional>
 #include <vulkan/vulkan_structs.hpp>
 
@@ -13,9 +15,18 @@ RenderPipeline::RenderPipeline(
     };
     shader = ctx.dev.createShaderModule(shaderCI);
 
+    // Every pass shares the warp push-constant range; shaders that do not
+    // declare the block simply ignore it.
+    vk::PushConstantRange pushRange {
+        .stageFlags = vk::ShaderStageFlagBits::eCompute,
+        .offset = 0,
+        .size = sizeof(WarpParams),
+    };
     vk::PipelineLayoutCreateInfo pipeLayoutCI {
         .setLayoutCount = 1,
         .pSetLayouts = &layout,
+        .pushConstantRangeCount = 1,
+        .pPushConstantRanges = &pushRange,
     };
     pipeLayout = ctx.dev.createPipelineLayout(pipeLayoutCI);
 
@@ -47,9 +58,14 @@ void RenderPipeline::render(
     vk::CommandBuffer cmdBuf,
     vk::ImageView in,
     vk::ImageView out,
-    vk::Extent2D outSize
+    vk::Extent2D outSize,
+    WarpParams const& warp
 ) {
     cmdBuf.bindPipeline(vk::PipelineBindPoint::eCompute, pipe);
+
+    cmdBuf.pushConstants(
+        pipeLayout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(WarpParams), &warp
+    );
 
     vk::DescriptorImageInfo descImgInfoIn {
         .imageView = in,
@@ -426,8 +442,11 @@ Renderer::Renderer(
     eyeExtent = createInfo.inputEyeExtent;
     outExtent = createInfo.outputExtent;
 
-    // TODO: This is not standard compliant, but it respects the binary format so only the colors
-    // should be messed up
+    // Images are created UNORM on purpose. The compute passes imageStore into
+    // them and GLSL has no sRGB storage qualifier, FFmpeg's Vulkan format map
+    // has no sRGB entries, and to_drm_format can only describe byte layouts.
+    // The bytes are identical either way; what the content means travels as
+    // colorspace metadata on the frames instead (see Output::contentFormat).
     vk::Format inputFormat = createInfo.format;
     if (inputFormat == vk::Format::eR8G8B8A8Srgb)
         inputFormat = vk::Format::eR8G8B8A8Unorm;
@@ -461,7 +480,10 @@ Renderer::Renderer(
 
     auto stagingImgCI = inputImgCI;
     stagingImgCI.extent.width = eyeExtent.width * 2;
-    stagingImgCI.usage = inputImgCI.usage | vk::ImageUsageFlagBits::eTransferDst;
+    // Non-final passes imageStore into staging images, so they need storage
+    // usage; the copy step needs transfer dst.
+    stagingImgCI.usage = inputImgCI.usage | vk::ImageUsageFlagBits::eTransferDst
+        | vk::ImageUsageFlagBits::eStorage;
 
     for (auto& img : stagingImgs) {
         img = createImage(vkCtx, stagingImgCI);
@@ -475,6 +497,9 @@ Renderer::Renderer(
         stagingImgCI.format,
         vkCtx.meta.vendor == Vendor::Nvidia ? HandleType::OpaqueFd : HandleType::DmaBuf
     );
+    // What SteamVR actually submitted, before the UNORM normalization above.
+    // Rides to VkFrame so the encoder can tag transfer/primaries/range.
+    output.contentFormat = (VkFormat)createInfo.format;
 
     vk::QueryPoolCreateInfo poolCI {
         .queryType = vk::QueryType::eTimestamp,
@@ -544,12 +569,37 @@ Renderer::Renderer(
     vk::SemaphoreCreateInfo semCI {
         .pNext = &timelineCI,
     };
-    // renderFinishedSem = vkCtx.dev.createSemaphore(semCI);
-
-    fence = vkCtx.dev.createFence({});
+    renderFinishedSem = vkCtx.dev.createSemaphore(semCI);
 }
 
-void Renderer::render(VkContext& vkCtx, u32 leftIdx, u32 rightIdx) {
+void Renderer::render(VkContext& vkCtx, u32 leftIdx, u32 rightIdx, int const waitFds[2]) {
+    // Import the input writers' sync files as temporary binary semaphores;
+    // the submission below waits on them at the transfer stage, so the eye
+    // copies start exactly when the writes complete.
+    vk::Semaphore importedSems[2] = {};
+    u32 importedCount = 0;
+    if (waitFds != nullptr) {
+        for (int e = 0; e < 2; ++e) {
+            if (waitFds[e] < 0) {
+                continue;
+            }
+            vk::Semaphore sem = vkCtx.dev.createSemaphore({});
+            vk::ImportSemaphoreFdInfoKHR importInfo {
+                .semaphore = sem,
+                .flags = vk::SemaphoreImportFlagBits::eTemporary,
+                .handleType = vk::ExternalSemaphoreHandleTypeFlagBits::eSyncFd,
+                .fd = waitFds[e],
+            };
+            if (vkCtx.dev.importSemaphoreFdKHR(&importInfo, vkCtx.dispatch)
+                == vk::Result::eSuccess) {
+                importedSems[importedCount++] = sem;
+            } else {
+                vkCtx.dev.destroy(sem);
+                close(waitFds[e]);
+            }
+        }
+    }
+
     vk::CommandBufferBeginInfo beginInfo {};
     cmdBuf.begin(beginInfo);
 
@@ -679,7 +729,7 @@ void Renderer::render(VkContext& vkCtx, u32 leftIdx, u32 rightIdx) {
         flushBarriers(barriers, vk::PipelineStageFlagBits::eTransfer | vk::PipelineStageFlagBits::eComputeShader,
                       vk::PipelineStageFlagBits::eComputeShader);
 
-        pipes[pipeIdx].render(vkCtx, cmdBuf, prev->view, nextOut->view, targetExtent);
+        pipes[pipeIdx].render(vkCtx, cmdBuf, prev->view, nextOut->view, targetExtent, warpParams);
         prev = nextOut;
     }
 
@@ -688,33 +738,54 @@ void Renderer::render(VkContext& vkCtx, u32 leftIdx, u32 rightIdx) {
 
     cmdBuf.end();
 
-    // vk::TimelineSemaphoreSubmitInfo timelineInfo {
-    //     .waitSemaphoreValueCount = 1,
-    //     .pWaitSemaphoreValues = &waitValue,
-    // };
-    vk::PipelineStageFlags waitStage = vk::PipelineStageFlagBits::eBottomOfPipe;
+    uint64_t signalValue = nextSignalValue++;
+    lastSubmittedValue = signalValue;
+
+    vk::TimelineSemaphoreSubmitInfo timelineInfo {
+        .signalSemaphoreValueCount = 1,
+        .pSignalSemaphoreValues = &signalValue,
+    };
+    vk::PipelineStageFlags waitStages[2] = {
+        vk::PipelineStageFlagBits::eTransfer,
+        vk::PipelineStageFlagBits::eTransfer,
+    };
     vk::SubmitInfo submitInfo {
-        // .pNext = &timelineInfo,
-        // .waitSemaphoreCount = 1,
-        // .pWaitSemaphores = &renderFinishedSem,
-        .pWaitDstStageMask = &waitStage,
+        .pNext = &timelineInfo,
+        .waitSemaphoreCount = importedCount,
+        .pWaitSemaphores = importedSems,
+        .pWaitDstStageMask = waitStages,
         .commandBufferCount = 1,
         .pCommandBuffers = &cmdBuf,
+        .signalSemaphoreCount = 1,
+        .pSignalSemaphores = &renderFinishedSem,
     };
 
-    vkCtx.useQueue([&](auto& queue) { queue.submit(submitInfo, fence); });
-    assert(vkCtx.dev.waitForFences(fence, true, UINT64_MAX) == vk::Result::eSuccess);
-    vkCtx.dev.resetFences(fence);
+    vkCtx.useQueue([&](auto& queue) { queue.submit(submitInfo); });
+
+    // The completion wait below also orders the destruction of the temporary
+    // imported semaphores: the queue waits on them until the submission
+    // finishes. A failed wait must throw, not fall through to the destroys.
+    vk::SemaphoreWaitInfo waitInfo {
+        .semaphoreCount = 1,
+        .pSemaphores = &renderFinishedSem,
+        .pValues = &signalValue,
+    };
+    if (vkCtx.dev.waitSemaphores(waitInfo, UINT64_MAX) != vk::Result::eSuccess) {
+        throw std::runtime_error("Failed waiting for render completion semaphore");
+    }
+
+    for (u32 i = 0; i < importedCount; ++i) {
+        vkCtx.dev.destroy(importedSems[i]);
+    }
 }
 
 void Renderer::destroy(VkContext const& ctx) {
-    // ctx.dev.destroy(renderFinishedSem);
+    ctx.dev.destroy(renderFinishedSem);
 
     for (auto& pipe : pipes) {
         pipe.destroy(ctx);
     }
 
-    ctx.dev.destroy(fence);
     ctx.dev.destroy(descLayout);
     ctx.dev.destroy(sampler);
 

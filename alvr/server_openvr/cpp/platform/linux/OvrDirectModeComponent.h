@@ -1,13 +1,17 @@
 #pragma once
 #include "alvr_server/PoseHistory.h"
 #include "alvr_server/Utils.h"
+#include "alvr_server/bindings.h"
 #include "openvr_driver.h"
 
 #include "alvr_server/Settings.h"
 
 #include <map>
 #include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <mutex>
+#include <thread>
 
 #include <vulkan/vulkan.h>
 
@@ -18,6 +22,7 @@ public:
     OvrDirectModeComponent(
         /* std::shared_ptr<Renderer> pVKRender,  */ std::shared_ptr<PoseHistory> poseHistory
     );
+    ~OvrDirectModeComponent();
 
     void RequestIdr() { enc.requestIdr(); }
 
@@ -29,6 +34,10 @@ public:
     // Called from the event loop thread when the client disconnects. Present
     // tears the encoder down and goes idle until the next connect.
     void RequestEncoderShutdown() { m_encoderState = EncoderState::ShutdownRequested; }
+
+    // Called on the event loop thread whenever the client's projection
+    // changes. Supplies the per-eye FOV the reprojection needs.
+    void SetViewParams(const FfiViewParams params[2]);
 
     /** Specific to Oculus compositor support, textures supplied must be created using this method.
      */
@@ -61,6 +70,9 @@ public:
     /** Called after Present to allow driver to take more time until vsync after they've
      * successfully acquired the sync texture in Present.*/
     virtual void PostPresent(const Throttling_t* pThrottling);
+
+    /** Called to get additional frame timing stats from driver. */
+    virtual void GetFrameTiming(vr::DriverDirectMode_FrameTiming* pFrameTiming);
 
 private:
     std::shared_ptr<PoseHistory> m_poseHistory;
@@ -95,4 +107,81 @@ private:
     std::atomic<EncoderState> m_encoderState { EncoderState::Idle };
 
     std::mutex m_presentMutex;
+
+    // The vsync announcer: fires VsyncEvent on every tick of the wall-clock
+    // grid, independent of the Present loop. A display's vsync does not stop
+    // when an application stalls; announcing only from PostPresent tied the
+    // declared rate to the frame loop, and one slow revolution then halved
+    // the schedule the compositor hands the app, a self-sustaining orbit
+    // that only ratchets downward.
+    void VsyncAnnouncerLoop();
+    std::thread m_vsyncAnnouncer;
+    std::atomic<bool> m_announcerExit { false };
+    // The most recent announced tick, nanoseconds on the steady clock.
+    // Written by the announcer, read by PostPresent to pace Present.
+    std::atomic<int64_t> m_lastTickNs { 0 };
+    // Ticks the grid skipped since the last GetFrameTiming.
+    std::atomic<uint32_t> m_skippedVsyncs { 0 };
+    // Last throttle hints, for change logging only.
+    uint32_t m_lastThrottleFrames = 0;
+    uint32_t m_lastPredictFrames = 0;
+
+    // Single-slot latest-wins mailbox: at steady state the worker drains
+    // faster than frames arrive, and if it falls behind, the newest frame
+    // replaces the stale pending one.
+    struct FrameJob {
+        uint32_t leftIdx;
+        uint32_t rightIdx;
+        uint64_t targetTimestampNs;
+        // Orientation the layer was rendered with, captured in Present. The
+        // worker needs it to build the reprojection, and it cannot read
+        // m_framePoseRotation itself because the compositor thread has
+        // overwritten it by then.
+        vr::HmdQuaternion_t renderOrientation;
+        // Encoder-state generation this job was built against. The worker
+        // discards the job if the generation moved (rebuild, shutdown, set
+        // switch) between enqueue and processing.
+        uint64_t generation;
+        // sync_file fds exported from the eye textures' write fences in
+        // Present. Owned by the job: every path that drops the job without
+        // presenting it must close them.
+        int waitFds[2] = { -1, -1 };
+        std::chrono::steady_clock::time_point enqueueTime;
+    };
+    void EncodeWorkerLoop();
+    // Drop a pending job. Call before any path that touches the encoder from
+    // the compositor thread.
+    void DrainPendingJob();
+
+    std::thread m_encodeWorker;
+    std::mutex m_jobMutex;
+    std::condition_variable m_jobCv;
+    FrameJob m_job {};
+    bool m_jobPending = false;
+    bool m_workerExit = false;
+    // Serializes encoder access: the worker's per-frame enc.present against
+    // the compositor thread's rebuild and shutdown paths. Never held together
+    // with m_jobMutex.
+    std::mutex m_encMutex;
+    // Incremented under m_encMutex by every compositor-thread path that
+    // mutates encoder state. A job whose generation is stale gets dropped
+    // instead of presenting old indices against rebuilt state.
+    uint64_t m_encGeneration = 0;
+
+    // A second dup of each imported texture fd, kept for exporting the
+    // writer's fences at Present. Replaced wholesale on every texture-set
+    // switch, so stale sets never accumulate.
+    int m_syncFds[6] = { -1, -1, -1, -1, -1, -1 };
+    // Consecutive writer-fence poll timeouts; at the threshold the GPU wait
+    // disarms for the session so a wedged writer degrades the stream once
+    // instead of taxing every frame.
+    uint32_t m_gpuWaitConsecTimeouts = 0;
+    bool m_gpuWaitPollDisarmed = false;
+
+    // Written by the event loop thread in SetViewParams, read by the worker.
+    // Invalid until the client's projection arrives, and the reprojection
+    // stays off until then because it has no FOV to build a ray from.
+    std::mutex m_viewParamsMutex;
+    FfiViewParams m_viewParams[2] {};
+    bool m_viewParamsValid = false;
 };
