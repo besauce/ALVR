@@ -478,7 +478,10 @@ Renderer::Renderer(
 
     auto stagingImgCI = inputImgCI;
     stagingImgCI.extent.width = eyeExtent.width * 2;
-    stagingImgCI.usage = inputImgCI.usage | vk::ImageUsageFlagBits::eTransferDst;
+    // Non-final passes imageStore into staging images, so they need storage
+    // usage; the copy step needs transfer dst.
+    stagingImgCI.usage = inputImgCI.usage | vk::ImageUsageFlagBits::eTransferDst
+        | vk::ImageUsageFlagBits::eStorage;
 
     for (auto& img : stagingImgs) {
         img = createImage(vkCtx, stagingImgCI);
