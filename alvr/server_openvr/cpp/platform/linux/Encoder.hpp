@@ -295,6 +295,12 @@ public:
             return;
         }
         renderer.get().warpParams = warp;
+        // The bitrate manager reports a target once per change; poll here so
+        // runtime updates actually reach the encoder.
+        auto dynamicParams = GetDynamicEncoderParams();
+        if (dynamicParams.updated) {
+            encoder->SetParams(dynamicParams);
+        }
         ReportPresent(targetTimestampNs, 0);
         renderer.get().render(vkCtx, leftIdx, rightIdx, waitFds);
         // Redundant while render() waits its own submission's timeline value;
