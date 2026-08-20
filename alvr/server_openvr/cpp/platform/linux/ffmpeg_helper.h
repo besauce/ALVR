@@ -108,13 +108,15 @@ public:
         VkImageCreateInfo image_info,
         VkDeviceSize size,
         VkDeviceMemory memory,
-        DrmImage drm
+        DrmImage drm,
+        VkFormat content_format
     );
     ~VkFrame();
     VkImage image() { return vkimage; }
     VkImageCreateInfo imageInfo() { return vkimageinfo; }
     VkFormat format() { return vkimageinfo.format; }
     AVPixelFormat avFormat() { return avformat; }
+    // Colorspace of the content as submitted (pre UNORM normalization).
     AVColorPrimaries colorPrimaries() const;
     AVColorTransferCharacteristic colorTransfer() const;
     AVColorSpace colorSpace() const;
@@ -129,6 +131,7 @@ private:
     vk::Device device;
     VkImage vkimage;
     VkImageCreateInfo vkimageinfo;
+    VkFormat contentformat;
     AVPixelFormat avformat;
 };
 

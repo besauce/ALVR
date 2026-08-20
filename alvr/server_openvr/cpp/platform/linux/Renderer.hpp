@@ -44,6 +44,9 @@ struct Output {
     // VkSemaphore semaphore;
     VkImageCreateInfo imageCI;
     VkDeviceSize size;
+    // Format SteamVR submitted, kept separate from imageCI.format which is
+    // normalized to UNORM for storage/FFmpeg/DRM compatibility.
+    VkFormat contentFormat;
 };
 
 struct PipelineCreateInfo {

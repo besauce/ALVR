@@ -238,7 +238,13 @@ public:
         // TODO: Fix Nvidia
 
         frame = std::make_unique<VkFrame>(
-            vkCtx, out.image.image, out.imageCI, out.size, out.image.memory, out.drm
+            vkCtx,
+            out.image.image,
+            out.imageCI,
+            out.size,
+            out.image.memory,
+            out.drm,
+            out.contentFormat
         );
 
         encoder

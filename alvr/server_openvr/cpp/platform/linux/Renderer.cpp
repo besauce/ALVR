@@ -440,8 +440,11 @@ Renderer::Renderer(
     eyeExtent = createInfo.inputEyeExtent;
     outExtent = createInfo.outputExtent;
 
-    // TODO: This is not standard compliant, but it respects the binary format so only the colors
-    // should be messed up
+    // Images are created UNORM on purpose. The compute passes imageStore into
+    // them and GLSL has no sRGB storage qualifier, FFmpeg's Vulkan format map
+    // has no sRGB entries, and to_drm_format can only describe byte layouts.
+    // The bytes are identical either way; what the content means travels as
+    // colorspace metadata on the frames instead (see Output::contentFormat).
     vk::Format inputFormat = createInfo.format;
     if (inputFormat == vk::Format::eR8G8B8A8Srgb)
         inputFormat = vk::Format::eR8G8B8A8Unorm;
@@ -484,6 +487,9 @@ Renderer::Renderer(
     output = createOutputImage(
         vkCtx, createInfo.outputExtent, stagingImgCI.format, HandleType::DmaBuf
     );
+    // What SteamVR actually submitted, before the UNORM normalization above.
+    // Rides to VkFrame so the encoder can tag transfer/primaries/range.
+    output.contentFormat = (VkFormat)createInfo.format;
 
     vk::QueryPoolCreateInfo poolCI {
         .queryType = vk::QueryType::eTimestamp,

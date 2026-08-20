@@ -31,7 +31,10 @@ AVPixelFormat vk_format_to_av_format(vk::Format vk_fmt) {
     throw std::runtime_error("unsupported vulkan pixel format " + std::to_string((VkFormat)vk_fmt));
 }
 
-AVColorPrimaries vk_format_to_av_primaries(VkFormat vk_fmt) {
+// The colorspace of a frame is keyed off the format SteamVR submitted, not
+// the created image format, which is normalized to UNORM before it gets here.
+// Static: these are file-local details of the mapping, not API.
+static AVColorPrimaries vk_format_to_av_primaries(VkFormat vk_fmt) {
     switch (vk_fmt) {
     case VK_FORMAT_R8G8B8A8_SRGB:
     case VK_FORMAT_B8G8R8A8_SRGB:
@@ -41,7 +44,7 @@ AVColorPrimaries vk_format_to_av_primaries(VkFormat vk_fmt) {
     }
 }
 
-AVColorTransferCharacteristic vk_format_to_av_trc(VkFormat vk_fmt) {
+static AVColorTransferCharacteristic vk_format_to_av_trc(VkFormat vk_fmt) {
     switch (vk_fmt) {
     case VK_FORMAT_R8G8B8A8_SRGB:
     case VK_FORMAT_B8G8R8A8_SRGB:
@@ -51,7 +54,7 @@ AVColorTransferCharacteristic vk_format_to_av_trc(VkFormat vk_fmt) {
     }
 }
 
-AVColorSpace vk_format_to_av_colorspace(VkFormat vk_fmt) {
+static AVColorSpace vk_format_to_av_colorspace(VkFormat vk_fmt) {
     switch (vk_fmt) {
     case VK_FORMAT_R8G8B8A8_SRGB:
     case VK_FORMAT_B8G8R8A8_SRGB:
@@ -61,10 +64,12 @@ AVColorSpace vk_format_to_av_colorspace(VkFormat vk_fmt) {
     }
 }
 
-AVColorRange vk_format_to_av_range(VkFormat vk_fmt) {
+static AVColorRange vk_format_to_av_range(VkFormat vk_fmt) {
     switch (vk_fmt) {
     case VK_FORMAT_R8G8B8A8_SRGB:
     case VK_FORMAT_B8G8R8A8_SRGB:
+        // The submitted images are RGB, which is full range by definition.
+        // Range conversion for the encoder happens downstream.
         return AVCOL_RANGE_JPEG;
     default:
         return AVCOL_RANGE_UNSPECIFIED;
@@ -111,10 +116,12 @@ alvr::VkFrame::VkFrame(
     VkImageCreateInfo image_info,
     VkDeviceSize size,
     VkDeviceMemory memory,
-    DrmImage drm
+    DrmImage drm,
+    VkFormat content_format
 )
     : vkimage(image)
-    , vkimageinfo(image_info) {
+    , vkimageinfo(image_info)
+    , contentformat(content_format) {
     device = vk_ctx.dev;
     avformat = vk_format_to_av_format(vk::Format(image_info.format));
 
@@ -163,19 +170,19 @@ alvr::VkFrame::~VkFrame() {
 }
 
 AVColorPrimaries alvr::VkFrame::colorPrimaries() const {
-    return vk_format_to_av_primaries(vkimageinfo.format);
+    return vk_format_to_av_primaries(contentformat);
 }
 
 AVColorTransferCharacteristic alvr::VkFrame::colorTransfer() const {
-    return vk_format_to_av_trc(vkimageinfo.format);
+    return vk_format_to_av_trc(contentformat);
 }
 
 AVColorSpace alvr::VkFrame::colorSpace() const {
-    return vk_format_to_av_colorspace(vkimageinfo.format);
+    return vk_format_to_av_colorspace(contentformat);
 }
 
 AVColorRange alvr::VkFrame::colorRange() const {
-    return vk_format_to_av_range(vkimageinfo.format);
+    return vk_format_to_av_range(contentformat);
 }
 
 std::unique_ptr<AVFrame, std::function<void(AVFrame*)>>
