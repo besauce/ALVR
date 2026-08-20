@@ -115,6 +115,10 @@ public:
     VkImageCreateInfo imageInfo() { return vkimageinfo; }
     VkFormat format() { return vkimageinfo.format; }
     AVPixelFormat avFormat() { return avformat; }
+    AVColorPrimaries colorPrimaries() const;
+    AVColorTransferCharacteristic colorTransfer() const;
+    AVColorSpace colorSpace() const;
+    AVColorRange colorRange() const;
     operator AVVkFrame*() const { return av_vkframe; }
     operator AVDRMFrameDescriptor*() const { return av_drmframe; }
     std::unique_ptr<AVFrame, std::function<void(AVFrame*)>> make_av_frame(VkFrameCtx& frame_ctx);

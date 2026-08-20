@@ -322,6 +322,8 @@ alvr::EncodePipelineVAAPI::EncodePipelineVAAPI(
     AVBufferSrcParameters* par = av_buffersrc_parameters_alloc();
     par->format = mapped_frame->format;
     par->hw_frames_ctx = av_buffer_ref(mapped_frame->hw_frames_ctx);
+    par->color_space = input_frame.colorSpace();
+    par->color_range = input_frame.colorRange();
     av_buffersrc_parameters_set(filter_in, par);
     av_free(par);
     if ((err = avfilter_init_str(filter_in, buffer_filter_args.str().c_str()))) {
