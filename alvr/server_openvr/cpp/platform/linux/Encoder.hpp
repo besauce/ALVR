@@ -291,6 +291,9 @@ public:
         renderer.get().warpParams = warp;
         ReportPresent(targetTimestampNs, 0);
         renderer.get().render(vkCtx, leftIdx, rightIdx, waitFds);
+        // Redundant while render() waits its own submission's timeline value;
+        // kept as the hook if submission ever goes async.
+        renderer.get().waitForRenderDone(vkCtx);
         ReportComposed(targetTimestampNs, 0);
 
         encoder->PushFrame(0, idrScheduler.CheckIDRInsertion());

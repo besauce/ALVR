@@ -553,9 +553,7 @@ Renderer::Renderer(
     vk::SemaphoreCreateInfo semCI {
         .pNext = &timelineCI,
     };
-    // renderFinishedSem = vkCtx.dev.createSemaphore(semCI);
-
-    fence = vkCtx.dev.createFence({});
+    renderFinishedSem = vkCtx.dev.createSemaphore(semCI);
 }
 
 void Renderer::render(VkContext& vkCtx, u32 leftIdx, u32 rightIdx, int const waitFds[2]) {
@@ -724,29 +722,41 @@ void Renderer::render(VkContext& vkCtx, u32 leftIdx, u32 rightIdx, int const wai
 
     cmdBuf.end();
 
-    // vk::TimelineSemaphoreSubmitInfo timelineInfo {
-    //     .waitSemaphoreValueCount = 1,
-    //     .pWaitSemaphoreValues = &waitValue,
-    // };
+    uint64_t signalValue = nextSignalValue++;
+    lastSubmittedValue = signalValue;
+
+    vk::TimelineSemaphoreSubmitInfo timelineInfo {
+        .signalSemaphoreValueCount = 1,
+        .pSignalSemaphoreValues = &signalValue,
+    };
     vk::PipelineStageFlags waitStages[2] = {
         vk::PipelineStageFlagBits::eTransfer,
         vk::PipelineStageFlagBits::eTransfer,
     };
     vk::SubmitInfo submitInfo {
-        // .pNext = &timelineInfo,
+        .pNext = &timelineInfo,
         .waitSemaphoreCount = importedCount,
         .pWaitSemaphores = importedSems,
         .pWaitDstStageMask = waitStages,
         .commandBufferCount = 1,
         .pCommandBuffers = &cmdBuf,
+        .signalSemaphoreCount = 1,
+        .pSignalSemaphores = &renderFinishedSem,
     };
 
-    vkCtx.useQueue([&](auto& queue) { queue.submit(submitInfo, fence); });
-    // The fence wait below also orders the destruction of the temporary
+    vkCtx.useQueue([&](auto& queue) { queue.submit(submitInfo); });
+
+    // The completion wait below also orders the destruction of the temporary
     // imported semaphores: the queue waits on them until the submission
-    // finishes, so destroying them earlier would be a use after free.
-    assert(vkCtx.dev.waitForFences(fence, true, UINT64_MAX) == vk::Result::eSuccess);
-    vkCtx.dev.resetFences(fence);
+    // finishes. A failed wait must throw, not fall through to the destroys.
+    vk::SemaphoreWaitInfo waitInfo {
+        .semaphoreCount = 1,
+        .pSemaphores = &renderFinishedSem,
+        .pValues = &signalValue,
+    };
+    if (vkCtx.dev.waitSemaphores(waitInfo, UINT64_MAX) != vk::Result::eSuccess) {
+        throw std::runtime_error("Failed waiting for render completion semaphore");
+    }
 
     for (u32 i = 0; i < importedCount; ++i) {
         vkCtx.dev.destroy(importedSems[i]);
@@ -754,13 +764,12 @@ void Renderer::render(VkContext& vkCtx, u32 leftIdx, u32 rightIdx, int const wai
 }
 
 void Renderer::destroy(VkContext const& ctx) {
-    // ctx.dev.destroy(renderFinishedSem);
+    ctx.dev.destroy(renderFinishedSem);
 
     for (auto& pipe : pipes) {
         pipe.destroy(ctx);
     }
 
-    ctx.dev.destroy(fence);
     ctx.dev.destroy(descLayout);
     ctx.dev.destroy(sampler);
 

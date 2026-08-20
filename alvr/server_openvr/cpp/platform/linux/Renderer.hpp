@@ -115,13 +115,33 @@ class Renderer {
     vk::CommandBuffer cmdBuf;
     vk::Sampler sampler;
     vk::DescriptorSetLayout descLayout;
-    vk::Fence fence;
 
     std::vector<detail::RenderPipeline> pipes;
 
-    // vk::Semaphore renderFinishedSem;
+    vk::Semaphore renderFinishedSem;
+    uint64_t nextSignalValue = 1;
+    uint64_t lastSubmittedValue = 0;
 
 public:
+    vk::Semaphore getRenderFinishedSemaphore() const { return renderFinishedSem; }
+    uint64_t getLastSubmittedValue() const { return lastSubmittedValue; }
+    void waitForRenderDone(VkContext const& vkCtx) const {
+        if (renderFinishedSem == VK_NULL_HANDLE) {
+            return;
+        }
+
+        vk::SemaphoreWaitInfo waitInfo {
+            .semaphoreCount = 1,
+            .pSemaphores = &renderFinishedSem,
+            .pValues = &lastSubmittedValue,
+        };
+
+        auto result = vkCtx.dev.waitSemaphores(waitInfo, UINT64_MAX);
+        if (result != vk::Result::eSuccess && result != vk::Result::eTimeout) {
+            throw std::runtime_error("Failed waiting for render completion semaphore");
+        }
+    }
+
     Renderer(
         VkContext const& vkCtx,
         RendererCreateInfo& createInfo,
