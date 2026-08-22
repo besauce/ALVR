@@ -25,13 +25,6 @@
 // slot is close to its next writer.
 constexpr double JobAgeLimitFrames = 1.5;
 
-// The declared vsync grid leads the real frame deadline by this much, a
-// fixed time rather than a fraction of the frame. Declaring a zero offset
-// advertises no headroom and heavy applications fall to half the refresh
-// rate; a lead inside the running start band Valve documents for direct
-// mode drivers, in milliseconds, holds at any refresh rate.
-constexpr auto RunningStart = std::chrono::microseconds(2000);
-
 // Consecutive writer-fence poll timeouts before the GPU wait disarms for the
 // session, so a permanently wedged writer degrades the stream once instead of
 // taxing every frame.
@@ -156,14 +149,14 @@ OvrDirectModeComponent::OvrDirectModeComponent(std::shared_ptr<PoseHistory> pose
     : m_poseHistory(poseHistory)
     , m_submitLayer(0) {
     m_encodeWorker = std::thread(&OvrDirectModeComponent::EncodeWorkerLoop, this);
-    m_vsyncAnnouncer = std::thread(&OvrDirectModeComponent::VsyncAnnouncerLoop, this);
+    StartVsyncAnnouncer();
 }
 
 OvrDirectModeComponent::~OvrDirectModeComponent() {
-    m_announcerExit = true;
-    if (m_vsyncAnnouncer.joinable()) {
-        m_vsyncAnnouncer.join();
-    }
+    // Stops before the encode worker: the announcer's grid is what
+    // PostPresent holds against, and a hold outliving the worker leaves a
+    // present waiting on a frame nothing will encode.
+    StopVsyncAnnouncer();
     {
         std::lock_guard<std::mutex> lock(m_jobMutex);
         m_workerExit = true;
@@ -701,42 +694,6 @@ void OvrDirectModeComponent::Present(vr::SharedTextureHandle_t syncTexture) {
     m_jobCv.notify_one();
 }
 
-void OvrDirectModeComponent::VsyncAnnouncerLoop() {
-    using std::chrono::steady_clock;
-
-    auto next = steady_clock::now() + frameInterval();
-    while (!m_announcerExit) {
-        auto const interval = frameInterval();
-        // Wake a phase lead before the tick and declare the vsync at that
-        // announce point. VsyncEvent takes a time offset in seconds, so
-        // declaring early gives WaitGetPoses release and pose prediction a
-        // head start on the real deadline. The offset self-corrects wake
-        // jitter: it goes slightly negative on oversleep, which reads as the
-        // vsync having just passed.
-        auto const announce = next - RunningStart;
-        std::this_thread::sleep_until(announce);
-        if (m_announcerExit) {
-            break;
-        }
-
-        double offset = std::chrono::duration_cast<std::chrono::duration<double>>(
-                            announce - steady_clock::now()
-        )
-                            .count();
-        vr::VRServerDriverHost()->VsyncEvent(offset);
-        m_lastTickNs = next.time_since_epoch().count();
-
-        // Advance along the grid, losing whole ticks that were missed rather
-        // than accumulating debt and snapping.
-        next += interval;
-        auto const now = steady_clock::now();
-        while (next <= now) {
-            next += interval;
-            m_skippedVsyncs++;
-        }
-    }
-}
-
 void OvrDirectModeComponent::PostPresent(const Throttling_t* pThrottling) {
     // Prop_Hmd_SupportsAppThrottling_Bool is set, so SteamVR sends throttle
     // hints here and predicts poses assuming we honor them. Ignoring them
@@ -757,25 +714,7 @@ void OvrDirectModeComponent::PostPresent(const Throttling_t* pThrottling) {
         }
     }
 
-    // Pace Present without owning the vsync declaration: the announcer fires
-    // events on the wall-clock grid whatever happens here, so a slow frame
-    // costs one frame instead of slowing the schedule the compositor hands
-    // the application. Holding this thread until the next tick keeps the
-    // compositor from free-running at encode speed, which floods the client
-    // decoder; adding the throttle hint holds it the extra frames SteamVR
-    // asked for.
-    using std::chrono::nanoseconds;
-    using std::chrono::steady_clock;
-
-    auto const interval = frameInterval();
-    int64_t const lastTickNs = m_lastTickNs;
-    if (lastTickNs == 0) {
-        std::this_thread::sleep_for(interval);
-        return;
-    }
-
-    auto const lastTick = steady_clock::time_point(nanoseconds(lastTickNs));
-    std::this_thread::sleep_until(lastTick + interval * (1 + throttleFrames));
+    PaceAfterPresent(throttleFrames);
 }
 
 void OvrDirectModeComponent::GetFrameTiming(vr::DriverDirectMode_FrameTiming* pFrameTiming) {
@@ -789,7 +728,7 @@ void OvrDirectModeComponent::GetFrameTiming(vr::DriverDirectMode_FrameTiming* pF
     // the rate, so the grid then skips a tick every frame and reports another
     // drop, throttled from then on. Consume the counter without reporting it
     // until there is a channel that does not throttle.
-    (void)m_skippedVsyncs.exchange(0);
+    (void)TakeSkippedVsyncs();
     pFrameTiming->m_nNumFramePresents = 1;
     pFrameTiming->m_nNumMisPresented = 0;
     pFrameTiming->m_nNumDroppedFrames = 0;
